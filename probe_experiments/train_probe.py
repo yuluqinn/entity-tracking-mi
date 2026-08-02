@@ -3,7 +3,7 @@ import os
 import logging
 from functools import partial
 import pdb
-from wandb.old.summary import h5py
+import h5py  # was `from wandb.old.summary import h5py`; wandb>=0.22 removed wandb.old
 # ignore warnings
 import warnings
 
@@ -56,7 +56,11 @@ _MAX_SOURCE_TEXT_LENGTH = {
     "Llama-3.1-405B": 2048,
     "CodeLlama-13b-hf": 4096,
     "gemma-2-2b": 8192,
-    "Qwen3-14B": 5120
+    "Qwen3-14B": 5120,
+    "Qwen3-VL-8B-Instruct": 4096,
+    "InternVL3_5-8B": 4096,
+    "Molmo2-8B": 4096,
+    "llava-onevision-qwen2-7b-ov-hf": 4096
 }
 
 _MAX_TARGET_TEXT_LENGTH = 100
@@ -71,7 +75,20 @@ _INPUT_DIMENSIONS = {
     "Llama-3.1-405B": 16384,
     "CodeLlama-13b-hf": 5120,
     "gemma-2-2b": 2304,
-    "Qwen3-14B": 5120
+    "Qwen3-14B": 5120,
+    "Qwen3-VL-8B-Instruct": 4096,  # text tower hidden size
+    "InternVL3_5-8B": 4096,        # qwen3 text tower, 36 layers
+    "Molmo2-8B": 4096,             # molmo2_text tower, 36 layers
+    "llava-onevision-qwen2-7b-ov-hf": 3584  # qwen2 text tower, 28 layers
+}
+
+# VLMs probed text-only. "unwrap": call the inner language model directly (needed when
+# the top-level forward requires pixel_values); "trc": repo needs trust_remote_code.
+_VLM_REGISTRY = {
+    "Qwen3-VL-8B-Instruct": {"trc": False, "unwrap": False},
+    "InternVL3_5-8B": {"trc": True, "unwrap": True},
+    "Molmo2-8B": {"trc": True, "unwrap": True},
+    "llava-onevision-qwen2-7b-ov-hf": {"trc": False, "unwrap": True},
 }
 
 # make deterministic
@@ -103,7 +120,8 @@ def load_act_containers_from_box_model_repo(args):
     if type(act_all_container_train) is list:
         # When using codellama
         for act in act_all_container_train:
-            act_container_train.append(act[args.layer - 1])
+            # cast: caches saved from bf16 models must match the fp32 probe
+            act_container_train.append(act[args.layer - 1].to(torch.float32))
             # print(f"each act_container_train shape: {act[args.layer - 1].shape}")
         act_all_container_train.clear()
     elif type(act_all_container_train) is torch.Tensor:
@@ -124,7 +142,7 @@ def load_act_containers_from_box_model_repo(args):
     if type(act_all_container_test) is list:
         # When using codellama
         for act in act_all_container_test:
-            act_container_test.append(act[args.layer - 1])
+            act_container_test.append(act[args.layer - 1].to(torch.float32))
         act_all_container_test.clear()
     elif type(act_all_container_test) is torch.Tensor:
         act_container_test = act_all_container_test.permute(1,0,2)[args.layer - 1].to(torch.float32)
@@ -709,7 +727,7 @@ def main():
     # Load object names
     print(args.object_vocabulary_file)
     object_map, object_list = get_object_mapping(args.object_vocabulary_file)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=_VLM_REGISTRY.get(args.model_type, {}).get("trc", False))
 
     act_container_train = []
     act_all_container_train = []
@@ -744,7 +762,8 @@ def main():
                     if len(act) == 0 and ("-" in args.condition_on or "_" in args.condition_on):
                         act_container_train.append([])
                     else:
-                        act_container_train.append(act[args.layer - 1])
+                        # cast: caches saved from bf16 models must match the fp32 probe
+                        act_container_train.append(act[args.layer - 1].to(torch.float32))
                         
             elif args.from_box_model: # load from box model repo, just copying the code from that repo here since it's a bit different from what's been doing here and I don't want to handle the conflicts rn.
                 act_container_train, act_container_test = load_act_containers_from_box_model_repo(args)
@@ -771,7 +790,7 @@ def main():
                     if len(act) == 0 and ("-" in args.condition_on or "_" in args.condition_on):
                         act_container_test.append([])
                     else:
-                        act_container_test.append(act[args.layer - 1])
+                        act_container_test.append(act[args.layer - 1].to(torch.float32))
             elif args.from_box_model: # load from box model repo, just copying the code from that repo here since it's a bit different from what's been doing here and I don't want to handle the conflicts rn.
                 act_container_train, act_container_test = load_act_containers_from_box_model_repo(args)
             else:
@@ -814,6 +833,22 @@ def main():
             model = GPTForProbing.from_pretrained(args.model_path)
         elif "llama" in args.model_type.lower() and not args.fsdp and not args.ndif_remote:
             model = LlamaForProbing.from_pretrained(args.model_path, **model_kwargs) #,device_map="auto",
+        elif args.model_type in _VLM_REGISTRY and not args.fsdp and not args.ndif_remote:
+            # VLMs probed text-only: hidden states come from the language tower through
+            # the generic output_hidden_states branch below
+            spec = _VLM_REGISTRY[args.model_type]
+            from transformers import AutoModel, AutoModelForImageTextToText
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    args.model_path, trust_remote_code=spec["trc"], **model_kwargs)
+            except (ValueError, KeyError):
+                # custom-code repos (e.g. InternVLChatModel) may only map AutoModel
+                model = AutoModel.from_pretrained(
+                    args.model_path, trust_remote_code=spec["trc"], **model_kwargs)
+            if spec["unwrap"]:
+                # top-level forward needs pixel_values; the language tower alone is
+                # exactly what text-only probing requires
+                model = model.language_model
         elif args.fsdp:
             model = fsdp_model(args)
         elif args.ndif_remote:
@@ -908,7 +943,7 @@ def main():
         probing_dataset_train = ObjectLocationProbeDataLoader(act_container_train, dataset_path_train, max_data=args.max_train_data)
         probing_dataset_test = ObjectLocationProbeDataLoader(act_container_test, dataset_path_test, max_data=args.max_test_data)
     elif args.incremental_local_state:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=_VLM_REGISTRY.get(args.model_type, {}).get("trc", False))
         train_dataset = GPTDataloaderForIncrementalLocalState(train_df, tokenizer, max_length=_MAX_SOURCE_TEXT_LENGTH[args.model_type], include_empty=not args.exclude_empty, condition_on=args.condition_on, min_prev_objects=args.condition_on_obj, include_prompt=args.include_prompt, object_map=object_map)
         test_dataset = GPTDataloaderForIncrementalLocalState(test_df, tokenizer, max_length=_MAX_SOURCE_TEXT_LENGTH[args.model_type], include_empty=not args.exclude_empty, condition_on=args.condition_on, min_prev_objects=args.condition_on_obj, include_prompt=args.include_prompt, object_map=object_map)
         probing_dataset_train = IncrementalLocalStateProbeDataLoader(act_container_train, train_dataset)
@@ -1005,9 +1040,45 @@ def main():
     os.makedirs(tconf.ckpt_path, exist_ok=True)
     trainer = Trainer(probe, train_dataset, test_dataset, tconf) if not args.mention else Mention_Trainer(probe, train_dataset, test_dataset, tconf)
     if not args.eval_only:
+        try:
+            import wandb
+            try:
+                logged_in = bool(wandb.api.api_key)  # wandb<=0.21
+            except Exception:
+                logged_in = bool(os.environ.get("WANDB_API_KEY")) or os.path.exists(os.path.expanduser("~/.netrc"))
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "entity-tracking-probing"),
+                name=f"{args.model_type}_{folder_name}_layer{args.layer}",
+                mode=None if logged_in else "offline",  # offline when not logged in; sync later with `wandb sync`
+                config={
+                    "model_type": args.model_type,
+                    "model_path": args.model_path,
+                    "layer": args.layer,
+                    "condition_on": args.condition_on,
+                    "binary_probe": args.binary_probe,
+                    "exclude_empty": getattr(args, "exclude_empty", None),
+                    "max_epochs": tconf.max_epochs,
+                    "batch_size": tconf.batch_size,
+                    "learning_rate": args.lr,
+                    "weight_decay": tconf.weight_decay,
+                    "lr_decay": tconf.lr_decay,
+                    "input_dim": input_dim,
+                    "probe_class": probe_class,
+                    "train_size": len(train_dataset),
+                    "test_size": len(test_dataset),
+                },
+            )
+        except Exception as e:
+            print(f"wandb logging disabled: {e}")
         predictions_matrix = trainer.train(prt=True).astype(int)
         trainer.save_traces()
         trainer.save_checkpoint()
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.finish()
+        except Exception:
+            pass
     else:
         trainer.load_checkpoint()
         predictions_matrix = trainer.predict(prt=True).astype(int)

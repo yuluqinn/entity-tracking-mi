@@ -13,7 +13,6 @@ def detect_removals(S):
     for o in range(num_objs):
         presence_over_time = S[:, :, o].any(axis=1)  # shape: (num_steps,)
         
-        if not presence_over_time.any():
             continue
         last_presence_time = np.where(presence_over_time)[0][-1]
         if last_presence_time < num_steps - 1:

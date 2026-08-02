@@ -129,6 +129,10 @@ def main():
         model_kwargs["torch_dtype"] = torch.bfloat16
     if args.use_remote:
         model = LanguageModel(args.model_dir, device_map="auto")
+    elif "qwen3-vl" in args.model_dir.lower():
+        # VLM checkpoint: AutoModelForCausalLM cannot load qwen3_vl; text-only generate works
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(args.model_dir, **model_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model_dir, **model_kwargs)
     if model_kwargs.get("quantization_config") is None and not args.distributed and not args.use_remote:

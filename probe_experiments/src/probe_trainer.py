@@ -15,6 +15,11 @@ import torch
 from torch.utils.data.dataloader import DataLoader
 from matplotlib import pyplot as plt
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 logger = logging.getLogger(__name__)
 
 MAX_NUM_OPERATIONS = 12
@@ -349,8 +354,20 @@ class Trainer:
         self.tokens = 0  # counter used for learning rate decay
         for epoch in range(self.config.max_epochs):
             self.run_epoch('train', prt, epoch)
+            if wandb is not None and wandb.run is not None:
+                epoch_log = {"epoch": epoch + 1,
+                             "train/loss": self.train_loss_cont[-1],
+                             "train/acc": self.train_acc_cont[-1]}
+                if self.train_acc_nontriv_cont:
+                    epoch_log["train/acc_nontriv"] = self.train_acc_nontriv_cont[-1]
+                wandb.log(epoch_log, commit=self.test_dataset is None)
             if self.test_dataset is not None:
                 test_loss, predictions_matrix = self.run_epoch('test', prt)
+                if wandb is not None and wandb.run is not None:
+                    test_log = {"test/loss": test_loss, "test/acc": self.test_acc_cont[-1]}
+                    if self.test_acc_nontriv_cont:
+                        test_log["test/acc_nontriv"] = self.test_acc_nontriv_cont[-1]
+                    wandb.log(test_log)
                 self.scheduler.step(test_loss)
                 if self.config.debug_train:
                     np.save(f"{self.config.ckpt_path}/predictions_epoch{epoch}.npy", predictions_matrix.astype(int))
@@ -674,12 +691,25 @@ class Mention_Trainer:
         
         for epoch in range(config.max_epochs):
             run_epoch('train')
+            if wandb is not None and wandb.run is not None:
+                wandb.log({"epoch": epoch + 1,
+                           "train/loss": self.train_loss_cont[-1],
+                           "train/acc": self.train_acc_cont[-1]},
+                          commit=self.test_dataset is None)
             if self.test_dataset is not None:
                 test_loss, predictions_matrix = run_epoch('test')
+                if wandb is not None and wandb.run is not None:
+                    test_log = {"test/loss": test_loss, "test/acc": self.test_acc_cont[-1]}
+                    if self.test_history:
+                        # mention-specific extras recorded per epoch in test_history
+                        for k in ("test_nontriv_acc", "test_recall", "test_precision"):
+                            if k in self.test_history[-1]:
+                                test_log["test/" + k.removeprefix("test_")] = self.test_history[-1][k]
+                    wandb.log(test_log)
                 if test_loss < best_loss:
                     best_loss = test_loss
                     self.save_checkpoint()
-                
+
         # return predictions after last epoch
         return predictions_matrix
     
