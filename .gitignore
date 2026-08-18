@@ -180,3 +180,5 @@ representations/
 probe_checkpoints/
 logs/
 data/
+wandb/
+
