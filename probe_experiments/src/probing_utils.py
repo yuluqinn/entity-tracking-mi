@@ -8,6 +8,20 @@ import numpy as np
 import torch
 from transformers import BitsAndBytesConfig, set_seed
 
+# VLMs supported text-only (probing + behavioral inference).
+#   trc: repo requires trust_remote_code
+#   loader: "imagetext" = AutoModelForImageTextToText, "causal_trc" = AutoModelForCausalLM(+trc)
+#   unwrap: use .language_model for hidden-state caching (top-level forward needs pixel_values)
+#   unwrap_for_generate: use .language_model.generate (only InternVL — its wrapper generate
+#     asserts img_context_token_id and returns completion-only tokens; its language_model is a
+#     full Qwen3ForCausalLM. Molmo2/LLaVA language_model lack lm_head — never unwrap for generate.)
+VLM_REGISTRY = {
+    "Qwen3-VL-8B-Instruct": {"trc": False, "loader": "imagetext", "unwrap": False, "unwrap_for_generate": False},
+    "InternVL3_5-8B": {"trc": True, "loader": "causal_trc", "unwrap": True, "unwrap_for_generate": True},
+    "Molmo2-8B": {"trc": True, "loader": "imagetext", "unwrap": True, "unwrap_for_generate": False},
+    "llava-onevision-qwen2-7b-ov-hf": {"trc": False, "loader": "imagetext", "unwrap": True, "unwrap_for_generate": False},
+}
+
 NON_OBJ_WORDS={
     "put", "remove", "move",
     "contains", "the", "nothing",

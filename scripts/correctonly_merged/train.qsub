@@ -1,0 +1,48 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l gpus=1
+#$ -l h_rt=12:00:00
+#$ -l gpu_c=8.0
+#$ -l gpu_type=L40S
+#$ -o logs/$JOB_ID_$JOB_NAME.log
+#$ -j y
+#$ -m e
+#$ -M yuluqinn24@gmail.com
+
+# === correctOnly-merged experiment: experiment-1 probes on the row-level-filtered, re-split original data ===
+# qsub -N co_<probe>_<tag> -v TAG=codellama13b,MODEL_TYPE=CodeLlama-13b-hf,MODEL_PATH=codellama/CodeLlama-13b-hf,N_LAYERS=40,PROBE=local|global|mention,ENV=nnsight_env scripts/correctonly_merged/train.qsub
+# Data: data/orig-correctOnly-$TAG (rows carry global_state -> per-row loader mode); caches: representations/$TAG-correctOnly.
+
+module load miniconda
+module load cuda/11.8
+conda activate /projectnb/tin-lab/yuluq/${ENV:-nnsight_env}
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export WANDB_PROJECT=entity-tracking-probing
+export WANDB_TAGS=${TAG}-correctOnly-merged,${PROBE}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
+
+DATA=$(pwd)/data/orig-correctOnly-$TAG
+REP=probe_experiments/representations/$TAG-correctOnly
+CKPT=probe_experiments/probe_checkpoints/$TAG-correctOnly
+case $PROBE in
+  local)   EXTRA="--binary_probe --exclude_empty"; CACHE=exclude_empty_conditioned_on_the; SUB=binary_the ;;
+  mention) EXTRA="--mention --binary_probe --exclude_empty"; CACHE=exclude_empty_conditioned_on_the; SUB=mention_the ;;
+  global)  EXTRA=""; CACHE=include_empty_conditioned_on_the; SUB=global_the ;;
+esac
+
+echo "JOB_START $(date +%s) $(date) probe=$PROBE tag=$TAG"
+for layer in $(seq 1 $N_LAYERS); do
+  echo "LAYER_START $layer $(date +%s)"
+  python probe_experiments/train_probe.py \
+    --model_type $MODEL_TYPE --model_path $MODEL_PATH \
+    --dataset_path $DATA --dataset_subset \
+    --layer $layer --epo 64 $EXTRA --condition_on the \
+    --checkpoint_root $CKPT/$SUB \
+    --load_model_representation --model_representation_path $REP/$CACHE \
+    --object_vocabulary_file data/objects/llama_friendly_objects.csv \
+    || { echo "LAYER_FAIL $layer"; exit 1; }
+  echo "LAYER_END $layer $(date +%s)"
+done
+echo "JOB_END $(date +%s) $(date)"

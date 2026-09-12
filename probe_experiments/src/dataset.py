@@ -28,6 +28,12 @@ _GPT_MAX_LENGTH = 512
 NUM_BOXES = 7
 
 
+def has_row_level_labels(raw_examples):
+    """True for row-level-filtered files, whose rows carry a precomputed `global_state`
+    (see scratch/correctonly_merged/build_dataset.py). Such files need not come in 7-row blocks."""
+    return bool(raw_examples) and "global_state" in raw_examples[0]
+
+
 def findall(s: str, substring: str) -> List[int]:
     return [m.start() for m in re.finditer(substring, s)]
 
@@ -132,7 +138,11 @@ class GPTDataloaderForInference(Dataset):
             self.data = self.data.reset_index()
 
 
-        self.prefix_text = self.data["prefix"]
+        # optional alternate model-input column (e.g. chat-template-wrapped prompts);
+        # label parsing elsewhere keeps reading the canonical prefix/sentence fields
+        cache_field = getattr(args, "cache_prefix_field", None) if args is not None else None
+        prefix_src = self.data[cache_field] if cache_field and cache_field in self.data.columns else self.data["prefix"]
+        self.prefix_text = prefix_src
         self.target_text = self.data["sentence"]
         self.max_length = max_length
 
@@ -141,10 +151,10 @@ class GPTDataloaderForInference(Dataset):
 
         elif self.condition_on == "contains":  # najoung's original data seems to not have "contains", but our data does
             # add " contains" to prefix
-            self.prefix_text = self.data["prefix"].apply(lambda x: x + " contains" if not x.endswith("contains") else x)
+            self.prefix_text = prefix_src.apply(lambda x: x + " contains" if not x.endswith("contains") else x)
         elif self.condition_on == "the":
             # add " contains the" to prefix
-            self.prefix_text = self.data["prefix"].apply(lambda x: x + " contains the" if not x.endswith("contains") else x + " the")
+            self.prefix_text = prefix_src.apply(lambda x: x + " contains the" if not x.endswith("contains") else x + " the")
 
         if isinstance(include_prompt, str):
             # self.prefix_text = self.prefix_text.apply(lambda x: PROMPT + ". ".join(x.split(". ")[:-1]) + ".\nStatement: " + x.split(". ")[-1])
@@ -303,14 +313,16 @@ class GPTDataloaderForInference(Dataset):
 class ProbeDataLoader(Dataset):
     """Loads box dataset into format used for probing."""
     
-    def __init__(self, activations, path_to_data, object_to_index_map, max_data=None):
+    def __init__(self, activations, path_to_data, object_to_index_map, max_data=None, box_label_base=0):
         """Initialize ProbeDataLoader.
 
         Args:
             activations (list): List of activations from LM to use as input for the probe.
             path_to_data (str): Path to corresponding dataset.
-            object_to_index_map (dict[str,int]): Mapping from object names to indices. 
+            object_to_index_map (dict[str,int]): Mapping from object names to indices.
+            box_label_base (int): lowest box number in the dataset (0 original, 1 vlm-data).
         """
+        self.box_label_base = box_label_base
         self.oti = object_to_index_map
         self.n_objects = len(self.oti.keys())
         self.examples, self.num_ops, counts, self.mentioned_objects = self.load_examples(path_to_data, max_examples=max_data)
@@ -323,30 +335,55 @@ class ProbeDataLoader(Dataset):
             self.num_ops = self.num_ops[0:0]
             self.mentioned_objects = self.num_ops[0:0]
         
-        assert len(self.activations) == NUM_BOXES * len(self.examples)
-        
+        # per-row files (rows carry a precomputed `global_state`) have one label per row;
+        # the original block files have one label per 7 consecutive rows
+        assert len(self.activations) == (len(self.examples) if self.per_row else NUM_BOXES * len(self.examples))
+
         self.n = len(self.activations)
-    
+
     def get_weights(self):
         return self.weights
-    
+
     def __len__(self):
         return self.n
-    
+
     def __getitem__(self, index):
-        return self.activations[index], self.examples[index // NUM_BOXES], torch.tensor(self.num_ops[index // NUM_BOXES]).to(torch.long),  self.mentioned_objects[index // NUM_BOXES]
-    
+        k = index if self.per_row else index // NUM_BOXES
+        return self.activations[index], self.examples[k], torch.tensor(self.num_ops[k]).to(torch.long),  self.mentioned_objects[k]
+
     def load_examples(self, path_to_data, max_examples=None):
-        
+
         raw_examples = []
-        
+
         with open(path_to_data, "r", encoding="UTF-8") as data_f:
             for line in data_f:
                 raw_examples.append(json.loads(line))
-        
-        
+
+        # Row-level-filtered files: every row carries `global_state` ({object: box_no}, the full
+        # state at its timestep, precomputed while the 7-row block was still intact), so the
+        # label no longer has to be assembled from sibling rows and blocks need not be complete.
+        self.per_row = has_row_level_labels(raw_examples)
+        if self.per_row:
+            counts = np.zeros((NUM_BOXES + 1))
+            examples, num_ops, all_mentioned_objects = [], [], []
+            for ex in raw_examples:
+                s_parts = ex["sentence"].strip(".").split(".")
+                box_contents = torch.zeros(self.n_objects)
+                for obj, box_no in ex["global_state"].items():
+                    box_contents[self.oti[obj]] = box_no + 1 - self.box_label_base
+                counts += np.array([torch.sum((box_contents == j) * torch.tensor([1.0], dtype=torch.float32)).item() for j in range(NUM_BOXES + 1)]).astype(float)
+                examples.append(box_contents)
+                num_ops.append([len(s_parts) - 2] * self.n_objects)
+                mentioned_objects = torch.zeros(self.n_objects)
+                for o in re.findall(r'the ([^ ,.]+)[ ,.]', " ".join(s_parts[:-1]) + " "):
+                    mentioned_objects[self.oti[o]] = 1
+                all_mentioned_objects.append(mentioned_objects)
+                if max_examples is not None and len(examples) == max_examples:
+                    break
+            return examples, num_ops, counts, all_mentioned_objects
+
         assert len(raw_examples) % NUM_BOXES == 0, f"Number of examples is not a multiple of {NUM_BOXES}!"
-        
+
         counts = np.zeros((NUM_BOXES + 1))
         examples = []
         num_ops = []
@@ -360,7 +397,7 @@ class ProbeDataLoader(Dataset):
                 contents = [_.replace("the ", "") for _ in ex["masked_content"].replace("<extra_id_0> ", "").replace("contains ", "").split(" and ")]
                 for c in contents:
                     oidx = self.oti[c]
-                    box_contents[oidx] = box_no + 1
+                    box_contents[oidx] = box_no + 1 - self.box_label_base
             
             if (i % NUM_BOXES) == (NUM_BOXES - 1):
                 counts += np.array([torch.sum((box_contents == j) * torch.tensor([1.0], dtype=torch.float32)).item() for j in range(NUM_BOXES + 1)]).astype(float)
@@ -369,7 +406,7 @@ class ProbeDataLoader(Dataset):
                 box_contents = torch.zeros(self.n_objects)
                 
                 mentioned_objects = torch.zeros(self.n_objects) #vector with mentioned objects
-                o_names = re.findall(r'the ([^ ,.]+) ', " ".join(s_parts[:-1]) + " ")
+                o_names = re.findall(r'the ([^ ,.]+)[ ,.]', " ".join(s_parts[:-1]) + " ")
                 for o in o_names: 
                     oidx = self.oti[o]
                     mentioned_objects[oidx] = 1
@@ -400,6 +437,9 @@ class BinaryProbeDataLoader(Dataset):
         self.n_objects = len(self.oti.keys())
 
         self.examples, self.num_ops, counts, self.mentioned_objects = self.load_examples(path_to_data, max_examples=max_data)
+        if max_data is not None and len(activations) > len(self.examples):
+            # cached activations cover the full split; align them with the truncated example list
+            activations = activations[:len(self.examples)]
         if local_operation_order != -1:
             self.examples, self.num_ops, counts, self.mentioned_objects, activations = self.load_examples_prior_states(
                 path_to_data, local_operation_order=local_operation_order, activations=activations,
@@ -435,8 +475,9 @@ class BinaryProbeDataLoader(Dataset):
             for line in data_f:
                 raw_examples.append(json.loads(line))
 
-        assert len(raw_examples) % NUM_BOXES == 0, f"Number of examples is not a multiple of {NUM_BOXES}!"
-        
+        if not has_row_level_labels(raw_examples):  # labels here are per row anyway; only the block layout is assumed
+            assert len(raw_examples) % NUM_BOXES == 0, f"Number of examples is not a multiple of {NUM_BOXES}!"
+
         counts = np.zeros((2))
         examples = []
         num_ops = []
@@ -463,7 +504,7 @@ class BinaryProbeDataLoader(Dataset):
                 num_ops.append([len(s_parts) - 2] * self.n_objects)
                 box_contents = torch.zeros(self.n_objects)
                 mentioned_objects = torch.zeros(self.n_objects) #vector with mentioned objects
-                o_names = re.findall(r'the ([^ ,.]+) ', " ".join(s_parts[:-1]) + " ")
+                o_names = re.findall(r'the ([^ ,.]+)[ ,.]', " ".join(s_parts[:-1]) + " ")
                 for o in o_names:
                     if o == "contents": # move content splits, not actual object
                         continue
@@ -1734,14 +1775,16 @@ class IncrementalLocalStateProbeDataLoader(Dataset):
 class MentionedProbeDataLoader(Dataset):
     """Loads box dataset into format used for probing."""
     
-    def __init__(self, activations, path_to_data, object_to_index_map, include_empty=True, min_prev_objects=-1):
+    def __init__(self, activations, path_to_data, object_to_index_map, include_empty=True, min_prev_objects=-1, box_label_base=0):
         """Initialize ProbeDataLoader.
 
         Args:
             activations (list): List of activations from LM to use as input for the probe.
             path_to_data (str): Path to corresponding dataset.
-            object_to_index_map (dict[str,int]): Mapping from object names to indices. 
+            object_to_index_map (dict[str,int]): Mapping from object names to indices.
+            box_label_base (int): lowest box number in the dataset (0 original, 1 vlm-data).
         """
+        self.box_label_base = box_label_base
         self.include_empty = include_empty
         self.min_prev_objects = min_prev_objects
         self.oti = object_to_index_map
@@ -1776,10 +1819,11 @@ class MentionedProbeDataLoader(Dataset):
         with open(path_to_data, "r", encoding="UTF-8") as data_f:
             for line in data_f:
                 raw_examples.append(json.loads(line))
-        
-        
-        assert len(raw_examples) % NUM_BOXES == 0, f"Number of examples is not a multiple of {NUM_BOXES}!"
-        
+
+
+        if not has_row_level_labels(raw_examples):  # labels here are per row anyway; only the block layout is assumed
+            assert len(raw_examples) % NUM_BOXES == 0, f"Number of examples is not a multiple of {NUM_BOXES}!"
+
         counts = np.zeros((2))
         examples = []
         num_ops = []
@@ -1788,7 +1832,7 @@ class MentionedProbeDataLoader(Dataset):
         box_contents = torch.zeros(self.n_objects) #vector with object positions, void = 0
         for i, ex in enumerate(raw_examples):
             s_parts = ex["sentence"].strip(".").split(".")
-            state_mat, removed_objs, _ = generate_state_matrix(ex["sentence"], self.oti, num_boxes=NUM_BOXES, num_obj=self.n_objects)
+            state_mat, removed_objs, _ = generate_state_matrix(ex["sentence"], self.oti, num_boxes=NUM_BOXES, num_obj=self.n_objects, box_base=self.box_label_base)
             s = s_parts[-1].strip()
             is_empty = True
             n_obj = 0

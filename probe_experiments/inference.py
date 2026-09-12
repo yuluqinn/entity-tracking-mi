@@ -127,18 +127,27 @@ def main():
         model_kwargs["quantization_config"] =  get_quantization_config(args)
     if model_kwargs.get("quantization_config") is None and transformers.utils.is_torch_bf16_gpu_available():
         model_kwargs["torch_dtype"] = torch.bfloat16
+    from src.probing_utils import VLM_REGISTRY
+    vlm_spec = next((v for k, v in VLM_REGISTRY.items() if k.lower() in args.model_dir.lower()), None)
     if args.use_remote:
         model = LanguageModel(args.model_dir, device_map="auto")
-    elif "qwen3-vl" in args.model_dir.lower():
-        # VLM checkpoint: AutoModelForCausalLM cannot load qwen3_vl; text-only generate works
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(args.model_dir, **model_kwargs)
+    elif vlm_spec is not None:
+        # VLM checkpoint: text-only generation; loader/trust_remote_code per registry
+        if vlm_spec["loader"] == "causal_trc":
+            model = AutoModelForCausalLM.from_pretrained(args.model_dir, trust_remote_code=True, **model_kwargs)
+        else:
+            from transformers import AutoModelForImageTextToText
+            model = AutoModelForImageTextToText.from_pretrained(
+                args.model_dir, trust_remote_code=vlm_spec["trc"], **model_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model_dir, **model_kwargs)
     if model_kwargs.get("quantization_config") is None and not args.distributed and not args.use_remote:
         model = model.to(device)
+    # InternVL's wrapper generate is broken text-only (img_context assert, completion-only
+    # return); its language_model is a full CausalLM. Others must NOT be unwrapped (no lm_head).
+    gen_model = model.language_model if (vlm_spec is not None and vlm_spec["unwrap_for_generate"]) else model
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=bool(vlm_spec and vlm_spec["trc"]))
     tokenizer.pad_token = tokenizer.eos_token
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -176,7 +185,7 @@ def main():
         batch_input = tokenizer(batch_sent, return_tensors="pt", padding=True, padding_side="left").to(device)
         with torch.no_grad():
             if not args.use_remote:
-                output = model.generate(
+                output = gen_model.generate(
                     **batch_input,
                     max_new_tokens=50,
                     stop_strings=[".", "\n", "Box"],

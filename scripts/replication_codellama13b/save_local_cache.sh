@@ -4,11 +4,16 @@
 #$ -l gpus=1
 #$ -l h_rt=12:00:00
 #$ -l gpu_c=8.0
-#$ -l gpu_memory=80G
-#$ -o logs/$JOB_ID_local_13b.log
+#$ -l gpu_type=L40S  # torch 2.7.1+cu126 has no sm_120 kernels: avoid RTXP6000 (Blackwell) nodes
+#$ -l gpu_memory=40G
+#$ -o logs/$JOB_ID_replication_codellama13b_save_local.log
 #$ -j y
 #$ -m e
 #$ -M yuluqinn24@gmail.com
+
+# === CodeLlama-13B REPLICATION (paper baseline) — local-probe cache ===
+# Caches last-token representations (all 41 layers) for the exclude_empty split,
+# used by both the local (binary) and mention probes. Uses the original nnsight_env.
 
 module load miniconda
 module load cuda/11.8
@@ -17,20 +22,14 @@ conda activate /projectnb/tin-lab/yuluq/nnsight_env
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH  # fixes GLIBCXX_3.4.30 import error
 
 export WANDB_PROJECT=entity-tracking-probing
+export WANDB_TAGS=codellama13b-replication
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-
-# caching dirs (HF token is read from ~/.cache/huggingface/token)
 export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
 
-#export CUDA_LAUNCH_BLOCKING=1
-index=$(($SGE_TASK_ID-1))
 ROOT=$(pwd)/probe_experiments
 
-
 python probe_experiments/train_probe.py \
-    --model_type llama \
-    --exp_name binary \
+    --model_type CodeLlama-13b-hf \
     --dataset_path $ROOT/../data/boxes_altAlways_default_maxop12_5k \
     --model_path codellama/CodeLlama-13b-hf \
     --layer 40 \
@@ -38,8 +37,8 @@ python probe_experiments/train_probe.py \
     --binary_probe \
     --exclude_empty \
     --condition_on the \
-    --checkpoint_root probe_experiments/probe_checkpoints/codellama-13b/binary_the \
+    --checkpoint_root probe_experiments/probe_checkpoints/codellama-13b-replication/binary_the \
     --save_model_representation \
-    --model_representation_path probe_experiments/representations/codellama-13b/exclude_empty_conditioned_on_the \
+    --model_representation_path probe_experiments/representations/codellama-13b-replication/exclude_empty_conditioned_on_the \
     --dataset_subset \
     --object_vocabulary_file data/objects/llama_friendly_objects.csv \

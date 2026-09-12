@@ -1,0 +1,41 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l gpus=1
+#$ -l h_rt=4:00:00
+#$ -l gpu_c=8.0
+#$ -l gpu_type=L40S
+#$ -l gpu_memory=40G
+#$ -o logs/$JOB_ID_$JOB_NAME.log
+#$ -j y
+#$ -m e
+#$ -M yuluqinn24@gmail.com
+
+# === VLM behavioral baseline: 0-SHOT COMPLETION, accuracy by ops count ===
+# Parameterized: qsub -N inf0_<tag> -v MODEL_PATH=<hf repo> scripts/behavioral/inference_0shot_vlm.qsub
+# bf16 (matches the probing runs; CodeLlama baseline is 8-bit per the paper).
+# Uses qwen3vl_env: the VLM classes need transformers 4.57.1.
+
+module load miniconda
+module load cuda/11.8
+
+conda activate /projectnb/tin-lab/yuluq/qwen3vl_env
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
+
+OUT_DIR=probe_experiments/results/boxes_altAlways_default_maxop12_5k/baseline_inference
+BASE=$(basename $MODEL_PATH)
+
+python probe_experiments/inference.py \
+    --model_dir $MODEL_PATH \
+    --data_path data/boxes_altAlways_default_maxop12_5k/test-subsample-states-gpt.jsonl \
+    --object_vocabulary_file data/objects/llama_friendly_objects.csv \
+    --output_dir $OUT_DIR \
+    --batch_size 16 \
+    || exit 1
+
+echo "=== aggregating (per-ops + overall aggregates) ==="
+python scratch/aggregate_inference.py \
+    $OUT_DIR/inference_${BASE}_test-subsample-states-gpt.jsonl

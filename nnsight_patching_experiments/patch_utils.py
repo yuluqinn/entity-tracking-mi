@@ -13,7 +13,7 @@ from nnsight import LanguageModel, CONFIG
 
 sys.path.append("..")
 from utils import get_model_and_tokenizer, load_dataloader, get_random_guess_baseline, fix_random_seed, str_to_bool, \
-    find_previous_query_box_pos, is_int_with_negatives, stupid_pad, PROMPT_ALTFORM, setup_nnsight
+    find_previous_query_box_pos, is_int_with_negatives, force_pad, PROMPT_ALTFORM, setup_nnsight
 
 
 def build_parser():
@@ -22,6 +22,8 @@ def build_parser():
     parser.add_argument('--model', help='hf model name', type=str, default="luodian/llama-7b-hf")
     parser.add_argument('--load_in_8bit', help='load in 8bit or not', action='store_true')
     parser.add_argument('--load_in_4bit', help='load in 4bit or not', action='store_true')
+    parser.add_argument('--dtype', help='torch dtype for unquantized loading (default: HF default, i.e. fp32)',
+                        type=str, choices=["auto", "float32", "float16", "bfloat16"], default=None)
     parser.add_argument('--remote', help='use NDIF remote to run nnsight code (necessary for big models)', action='store_true')
     parser.add_argument('--load_graph', help='if eval only, path to load the graph from', type=str, default=None)
 
@@ -119,7 +121,12 @@ def get_model_and_dataset(args):
         qcfg = BitsAndBytesConfig(load_in_8bit=True)
     elif args.load_in_4bit:
         qcfg = BitsAndBytesConfig(load_in_4bit=True)
-    model = LanguageModel(args.model, device_map="auto", dispatch=True, quantization_config = qcfg)
+    model_kwargs = {}
+    if getattr(args, "dtype", None) is not None:
+        import torch
+        model_kwargs["torch_dtype"] = "auto" if args.dtype == "auto" else getattr(torch, args.dtype)
+    model = LanguageModel(args.model, device_map="auto", dispatch=True, quantization_config = qcfg, **model_kwargs)
+    print(f"model dtype: {next(model.parameters()).dtype}")
     model.tokenizer.padding_side = "right"
     if any([t in args.model for t in ["gemma", "Llama-3.", "santacoder"]]):
         prepend_space_to_answer = True

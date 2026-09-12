@@ -641,7 +641,9 @@ def cache_logit_and_hidden(
 
             clean_hs_saved = None
 
-            with model.trace(tokens_batch, remote=remote) as tracer:
+            # use_cache=False to match the patched passes exactly: with default use_cache the HF attention path
+            # differs numerically (up to ~0.15 nats/example in fp16), which otherwise leaks into every patch score
+            with model.trace(tokens_batch, remote=remote, use_cache=False) as tracer:
                 if save_hs:
                     clean_hs = []
                     for sender_layer in range(N_LAYERS):

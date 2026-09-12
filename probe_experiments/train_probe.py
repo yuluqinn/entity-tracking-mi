@@ -82,14 +82,8 @@ _INPUT_DIMENSIONS = {
     "llava-onevision-qwen2-7b-ov-hf": 3584  # qwen2 text tower, 28 layers
 }
 
-# VLMs probed text-only. "unwrap": call the inner language model directly (needed when
-# the top-level forward requires pixel_values); "trc": repo needs trust_remote_code.
-_VLM_REGISTRY = {
-    "Qwen3-VL-8B-Instruct": {"trc": False, "unwrap": False},
-    "InternVL3_5-8B": {"trc": True, "unwrap": True},
-    "Molmo2-8B": {"trc": True, "unwrap": True},
-    "llava-onevision-qwen2-7b-ov-hf": {"trc": False, "unwrap": True},
-}
+# shared VLM support table (trc / loader / unwrap flags) — see src/probing_utils.py
+from src.probing_utils import VLM_REGISTRY as _VLM_REGISTRY
 
 # make deterministic
 torch.manual_seed(0)
@@ -223,7 +217,20 @@ def get_activations_from_data(act_all_container, act_container, args, end_idx, i
     if not os.path.exists(ckpt_folder_path):
         os.makedirs(ckpt_folder_path, exist_ok=True)
     num_examples_cached, num_batch_cached, _ = read_caching_history(ckpt_folder_path, load_act=False)
-    
+
+    pooling_boundaries = None
+    if getattr(args, "pooling", "last") == "mean_context":
+        # mean over context tokens only: boundary = first token of the query phrase " Box k contains"
+        assert args.caching_batch_size == 1, "mean_context pooling requires caching_batch_size=1 (left-padding would poison the mean)"
+        ds = dataloader.dataset
+        base_ds = ds.dataset if isinstance(ds, torch.utils.data.Subset) else ds
+        texts = list(base_ds.prefix_text)
+        if isinstance(ds, torch.utils.data.Subset):
+            texts = [texts[j] for j in ds.indices]
+        # context tokenization is a prefix of the full tokenization (verified: sentence
+        # boundary "." + " Box" tokenize independently for the supported tokenizers)
+        pooling_boundaries = [len(tokenizer(t[:t.rfind(" Box ")])["input_ids"]) for t in texts]
+
     for batch_idx, data in tqdm(enumerate(dataloader), total=len(dataloader), desc="caching activations"):
         # if bnatch_idx < num_batch_cached or this batch already cached, skip
         # assert num_examples_cached % args.caching_batch_size == 0, "cached examples not aligned with caching batch size"
@@ -318,10 +325,17 @@ def get_activations_from_data(act_all_container, act_container, args, end_idx, i
                 act = model(input_ids=ids, attention_mask=mask, output_hidden_states=True).hidden_states
 
             for i in range(len(ids)):
-                
+
                 if not args.ndif_remote:
-                    act_all_container.append([a[i, batch_token_pos[i], :].detach().cpu().unsqueeze(0) for a in act])
-                    act_container.append(act[args.layer - 1][i, batch_token_pos[i], :].detach().cpu().unsqueeze(0))
+                    if pooling_boundaries is not None:
+                        b = pooling_boundaries[batch_idx * args.caching_batch_size + i]
+                        start = 1 if (tokenizer.bos_token_id is not None and ids[i][0].item() == tokenizer.bos_token_id) else 0
+                        assert b > start and b < ids.shape[1], f"bad pooling boundary {b} for seq len {ids.shape[1]}"
+                        act_all_container.append([a[i, start:b, :].to(torch.float32).mean(dim=0).detach().cpu().unsqueeze(0) for a in act])
+                        act_container.append(act[args.layer - 1][i, start:b, :].to(torch.float32).mean(dim=0).detach().cpu().unsqueeze(0))
+                    else:
+                        act_all_container.append([a[i, batch_token_pos[i], :].detach().cpu().unsqueeze(0) for a in act])
+                        act_container.append(act[args.layer - 1][i, batch_token_pos[i], :].detach().cpu().unsqueeze(0))
                 else:
                     act_all_container.append(act_all_container_elems[i])
                     act_container.append(act_container_elems[i])
@@ -510,6 +524,24 @@ def main():
                         type=str,
                         dest='condition_on',
                         default='number')
+    parser.add_argument('--box_label_base',
+                        type=int,
+                        default=0,
+                        help="lowest box number in the dataset (0 = original boxes 0-6; 1 = vlm-data boxes 1-7). "
+                             "Used by the global-probe labels and the state-matrix parser")
+    parser.add_argument('--cache_prefix_field',
+                        type=str,
+                        default=None,
+                        help="dataset column to use as the model input at caching time (e.g. a "
+                             "chat-template-wrapped prompt); label parsing still reads prefix/sentence. "
+                             "Default: use the prefix column (original behavior)")
+    parser.add_argument('--pooling',
+                        type=str,
+                        choices=['last', 'mean_context'],
+                        default='last',
+                        help="representation pooling at caching time: 'last' = the conditioned token "
+                             "(original behavior); 'mean_context' = mean over context tokens (description "
+                             "+ operations, through the final period before the query phrase), BOS excluded")
     parser.add_argument('--incremental_local_state',
                         dest='incremental_local_state',
                         action='store_true',
@@ -586,6 +618,10 @@ def main():
     parser.add_argument('--model_representation_path',
                         default=None,
                         type=str)
+    parser.add_argument('--standardize_inputs',
+                        action='store_true',
+                        help='z-score each activation dimension with the TRAIN split mean/std before the probe '
+                             '(applied to train and test; default off = released recipe, raw activations)')
 
     parser.add_argument('--save_model_representation',
                         dest="save_model_representation",
@@ -695,6 +731,8 @@ def main():
         folder_name = folder_name + f"_incremental_local_state"
     if args.mention:
         folder_name = folder_name + f"_mention"
+    if args.pooling != "last":
+        folder_name = folder_name + f"_{args.pooling}"
 
     training_file = os.path.join(args.checkpoint_root, folder_name, f"layer{args.layer}_token1", "tensorboard.txt")
     if not args.overwrite_cache and os.path.exists(training_file) and len(open(training_file).readlines())>0:
@@ -927,6 +965,15 @@ def main():
 
     probe_class = 8 if not args.binary_probe else 2
     input_dim = _INPUT_DIMENSIONS[args.model_type]
+    if args.standardize_inputs:
+        # per-dimension z-scoring with TRAIN statistics only; test rows use the same mu/sd (no leakage)
+        assert all(torch.is_tensor(a) for a in act_container_train), "standardize_inputs expects cached per-row activation tensors"
+        _stack = torch.stack([a.reshape(-1) for a in act_container_train])
+        _mu, _sd = _stack.mean(0, keepdim=True), _stack.std(0, keepdim=True) + 1e-6
+        act_container_train = [((a.reshape(1, -1) - _mu) / _sd).reshape(a.shape) for a in act_container_train]
+        act_container_test = [((a.reshape(1, -1) - _mu) / _sd).reshape(a.shape) for a in act_container_test]
+        print(f"standardized inputs with train stats: {len(act_container_train)} train / {len(act_container_test)} test rows, dim {_stack.shape[1]}")
+        del _stack
     # pdb.set_trace(header="before initializing probing datasets")
     # if moveContent split, need to load the whole dataset, then apply subsample mask after computing prior states
     train_subset_mask, test_subset_mask = None, None
@@ -953,8 +1000,8 @@ def main():
             probing_dataset_train = SpanProbeDataLoader(act_container_train, dataset_path_train, object_map,include_empty=not args.exclude_empty,min_prev_objects=args.condition_on_obj,max_data=args.max_train_data, tokenizer=tokenizer,expand_query_box=args.expand_query_box,balance_label_sampling=args.balance_label_sampling, span_probe_type=args.condition_on, args=args, split="train", same_phrase_only=args.same_phrase_only in ["train", "both"])
             probing_dataset_test = SpanProbeDataLoader(act_container_test, dataset_path_test, object_map,include_empty=not args.exclude_empty,min_prev_objects=args.condition_on_obj,max_data=args.max_test_data, tokenizer=tokenizer,expand_query_box=args.expand_query_box,balance_label_sampling=args.balance_label_sampling, span_probe_type=args.condition_on, args=args, split="test", same_phrase_only=args.same_phrase_only in ["test", "both"])
         elif args.mention:
-            probing_dataset_train = MentionedProbeDataLoader(act_container_train, dataset_path_train, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj)
-            probing_dataset_test = MentionedProbeDataLoader(act_container_test, dataset_path_test, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj)
+            probing_dataset_train = MentionedProbeDataLoader(act_container_train, dataset_path_train, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj, box_label_base=args.box_label_base)
+            probing_dataset_test = MentionedProbeDataLoader(act_container_test, dataset_path_test, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj, box_label_base=args.box_label_base)
         else:
             probing_dataset_train = BinaryProbeDataLoader(act_container_train, dataset_path_train, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj, max_data=args.max_train_data, local_operation_order=args.num_prior_state, subset_mask=train_subset_mask)
             probing_dataset_test = BinaryProbeDataLoader(act_container_test, dataset_path_test, object_map, include_empty=not args.exclude_empty, min_prev_objects=args.condition_on_obj, max_data=args.max_test_data, local_operation_order=args.num_prior_state, subset_mask=test_subset_mask)
@@ -962,8 +1009,8 @@ def main():
         probing_dataset_train = PhraseProbeDataLoader(act_container_train, dataset_path_train, object_map,include_empty=not args.exclude_empty, max_data=args.max_train_data, tokenizer=tokenizer, args=args, split="train", activation_h5_path=act_all_h5_train_dir)
         probing_dataset_test = PhraseProbeDataLoader(act_container_test, dataset_path_test, object_map,include_empty=not args.exclude_empty, max_data=args.max_test_data, tokenizer=tokenizer, args=args, split="test", activation_h5_path=act_all_h5_test_dir)
     else:
-        probing_dataset_train = ProbeDataLoader(act_container_train, dataset_path_train, object_map, max_data=args.max_train_data)
-        probing_dataset_test = ProbeDataLoader(act_container_test, dataset_path_test, object_map, max_data=args.max_test_data)
+        probing_dataset_train = ProbeDataLoader(act_container_train, dataset_path_train, object_map, max_data=args.max_train_data, box_label_base=args.box_label_base)
+        probing_dataset_test = ProbeDataLoader(act_container_test, dataset_path_test, object_map, max_data=args.max_test_data, box_label_base=args.box_label_base)
 
     train_dataset, test_dataset = probing_dataset_train, probing_dataset_test
     
@@ -1013,17 +1060,17 @@ def main():
             probe = BatteryProbeClassificationTwoLayer(device,
                 input_dim=input_dim,
                 probe_class=probe_class,
-                num_task=100,
+                num_task=len(object_map),  # one task per vocabulary object (=100 for the original vocab)
                 mid_dim=args.mid_dim,
                 ce_weights=probing_dataset_train.get_weights().to(device, dtype=torch.float32),
-                )             
-        else: 
+                )
+        else:
             probe = BatteryProbeClassification(device,
                 input_dim=input_dim,
                 probe_class=probe_class,
-                num_task=100,
+                num_task=len(object_map),  # one task per vocabulary object (=100 for the original vocab)
                 ce_weights=probing_dataset_train.get_weights().to(device, dtype=torch.float32),
-                )        
+                )
             
     max_epochs = args.epo
     t_start = time.strftime("_%Y%m%d_%H%M%S")
@@ -1057,6 +1104,7 @@ def main():
                     "condition_on": args.condition_on,
                     "binary_probe": args.binary_probe,
                     "exclude_empty": getattr(args, "exclude_empty", None),
+                    "standardize_inputs": args.standardize_inputs,
                     "max_epochs": tconf.max_epochs,
                     "batch_size": tconf.batch_size,
                     "learning_rate": args.lr,

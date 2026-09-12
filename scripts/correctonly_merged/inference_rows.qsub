@@ -1,0 +1,34 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l gpus=1
+#$ -l h_rt=6:00:00
+#$ -l gpu_c=8.0
+#$ -l gpu_type=L40S
+#$ -l gpu_memory=40G
+#$ -o logs/$JOB_ID_$JOB_NAME.log
+#$ -j y
+#$ -m e
+#$ -M yuluqinn24@gmail.com
+
+# === correctOnly-merged experiment: 0-shot bf16 behavioral inference on an arbitrary split file ===
+# qsub -N inf_<tag> -v MODEL_PATH=<hf repo>,DATA_PATH=<jsonl> scripts/correctonly_merged/inference_rows.qsub
+# Same settings as the existing bf16 test-row runs (no quantization -> bf16; batch 16; qwen3vl_env).
+
+module load miniconda
+module load cuda/11.8
+conda activate /projectnb/tin-lab/yuluq/qwen3vl_env
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
+
+OUT_DIR=probe_experiments/results/boxes_altAlways_default_maxop12_5k/baseline_inference
+echo "START $(date +%s) $(date)"
+python probe_experiments/inference.py \
+    --model_dir $MODEL_PATH \
+    --data_path $DATA_PATH \
+    --object_vocabulary_file data/objects/llama_friendly_objects.csv \
+    --output_dir $OUT_DIR \
+    --batch_size 16 \
+    || exit 1
+echo "END $(date +%s) $(date)"

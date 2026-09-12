@@ -182,3 +182,6 @@ logs/
 data/
 wandb/
 
+
+# path-patching / circuit outputs (large .npy/.pkl caches)
+outputs/

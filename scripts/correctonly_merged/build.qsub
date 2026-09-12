@@ -1,0 +1,14 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l mem_per_core=8G
+#$ -l h_rt=2:00:00
+#$ -o logs/$JOB_ID_$JOB_NAME.log
+#$ -j y
+# qsub -N build_<tag> -v TAG=...,SHORT=...,INF=... scripts/correctonly_merged/build.qsub
+module load miniconda
+conda activate /projectnb/tin-lab/yuluq/nnsight_env
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+echo "JOB_START $(date +%s) $(date)"
+python scratch/correctonly_merged/build_dataset.py $TAG $SHORT $INF || exit 1
+echo "JOB_END $(date +%s) $(date)"

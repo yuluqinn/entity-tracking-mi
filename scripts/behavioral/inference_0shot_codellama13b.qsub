@@ -1,0 +1,41 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l gpus=1
+#$ -l h_rt=8:00:00
+#$ -l gpu_c=8.0
+#$ -l gpu_type=L40S
+#$ -l gpu_memory=40G
+#$ -o logs/$JOB_ID_inference_0shot_codellama13b.log
+#$ -j y
+#$ -m e
+#$ -M yuluqinn24@gmail.com
+
+# === CodeLlama-13B behavioral baseline: 0-SHOT COMPLETION, accuracy by ops count ===
+# Fixed version of the released inference_default.qsub: runs from the repo root
+# (the original's `cd probe_experiments` breaks imports), local data/vocab paths,
+# no prompt format (0-shot = bare prefix completion), 8-bit as in the paper.
+
+module load miniconda
+module load cuda/11.8
+
+conda activate /projectnb/tin-lab/yuluq/nnsight_env
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
+
+OUT_DIR=probe_experiments/results/boxes_altAlways_default_maxop12_5k/baseline_inference
+
+python probe_experiments/inference.py \
+    --model_dir codellama/CodeLlama-13b-hf \
+    --data_path data/boxes_altAlways_default_maxop12_5k/test-subsample-states-gpt.jsonl \
+    --object_vocabulary_file data/objects/llama_friendly_objects.csv \
+    --output_dir $OUT_DIR \
+    --batch_size 16 \
+    --load_in_8bit \
+    || exit 1
+
+echo "=== aggregating (per-ops + overall aggregates) ==="
+python scratch/aggregate_inference.py \
+    $OUT_DIR/inference_CodeLlama-13b-hf_8bit_test-subsample-states-gpt.jsonl

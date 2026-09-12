@@ -1,0 +1,46 @@
+#!/bin/bash -l
+#$ -P tin-lab
+#$ -pe omp 4
+#$ -l gpus=1
+#$ -l h_rt=2:00:00
+#$ -l gpu_c=8.0
+#$ -l gpu_type=L40S
+#$ -l gpu_memory=40G
+#$ -o logs/$JOB_ID_smoke_0shot_vlms.log
+#$ -j y
+
+# Smoke: 0-shot completion for all 4 VLMs on a 70-row slice; prints 3 sample
+# generations per model so completions can be eyeballed before the full runs.
+
+module load miniconda
+module load cuda/11.8
+
+conda activate /projectnb/tin-lab/yuluq/qwen3vl_env
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME="/projectnb/tin-lab/yuluq/transformer_cache/"
+
+head -70 data/boxes_altAlways_default_maxop12_5k/test-subsample-states-gpt.jsonl > scratch/behavioral_smoke_70.jsonl
+OUT_DIR=scratch/behavioral_smoke_out
+mkdir -p $OUT_DIR
+
+for MODEL_PATH in Qwen/Qwen3-VL-8B-Instruct OpenGVLab/InternVL3_5-8B allenai/Molmo2-8B llava-hf/llava-onevision-qwen2-7b-ov-hf; do
+    BASE=$(basename $MODEL_PATH)
+    echo "=== SMOKE $MODEL_PATH ==="
+    python probe_experiments/inference.py \
+        --model_dir $MODEL_PATH \
+        --data_path scratch/behavioral_smoke_70.jsonl \
+        --object_vocabulary_file data/objects/llama_friendly_objects.csv \
+        --output_dir $OUT_DIR \
+        --batch_size 16 \
+        || { echo "SMOKE FAILED: $MODEL_PATH"; exit 1; }
+    echo "--- sample generations ($BASE):"
+    python -c "
+import json
+rows = [json.loads(l) for l in open('$OUT_DIR/inference_${BASE}_behavioral_smoke_70.jsonl')]
+print(f'rows: {len(rows)}')
+for r in rows[:3]:
+    print('  GEN:', repr(r['original_answer'])[:90], '| GOLD:', r['gold_answer'][:50], '| correct:', r['correct'])
+"
+done
+echo "ALL VLM SMOKES PASSED"

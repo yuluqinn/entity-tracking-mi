@@ -120,6 +120,14 @@ def free_gpu_cache():
     gc.collect()
     torch.cuda.empty_cache()
 
+def _nn_apply(fn, *args, **kwargs):
+    """nnsight<=0.5 exposed nnsight.apply(fn, ...) to call a python function inside a trace; nnsight>=0.6 executes
+    the trace body on real tensors, so the function can be called directly."""
+    if hasattr(nnsight, "apply"):
+        return nnsight.apply(fn, *args, **kwargs)
+    return fn(*args, **kwargs)
+
+
 def setup_nnsight():
     """
     Setup script for nnsight
@@ -1231,7 +1239,7 @@ def get_basis_directions(
                     # rs = getter(model).output[0].detach().save()  # nnsight <= 0.5 behavior, where output used to be a tuple, deprecated after
                     rs = getter(model).output.detach()   # nnsight >= 0.5 behavior, output is just (batch, seq, h_dim)
                     if if_normalize_object_phrase:
-                        rs = nnsight.apply(normalize_object_phrase, rs, inp["input_ids"], model.tokenizer)
+                        rs = _nn_apply(normalize_object_phrase, rs, inp["input_ids"], model.tokenizer)
                     rs = rs[:, position_to_norm_indices[position]].cpu().numpy().save()  # [bs, model_dim]
                     raw_activations[layer_idx].append(rs)
 
@@ -1288,7 +1296,7 @@ def get_mean_activations(
                     getter = operator.attrgetter(layer)
                     o_proj_input = getter(model).input.detach()
                     if if_normalize_object_phrase:
-                        o_proj_input = nnsight.apply(normalize_object_phrase, o_proj_input, inp["input_ids"], model.tokenizer)
+                        o_proj_input = _nn_apply(normalize_object_phrase, o_proj_input, inp["input_ids"], model.tokenizer)
                     if layer in mean_activations:
                         mean_activations[layer] = (mean_activations[layer] + o_proj_input.sum(0)).save()
                     else:
@@ -1603,7 +1611,7 @@ def eval_circuit_performance(
                 for layer in modules:
                     getter = operator.attrgetter(layer)
                     original_input = getter(model).input.clone()
-                    ablated_input = nnsight.apply(
+                    ablated_input = _nn_apply(
                         mean_ablate,
                         original_input,
                         layer,

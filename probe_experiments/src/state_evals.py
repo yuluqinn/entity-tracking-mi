@@ -12,7 +12,8 @@ def detect_removals(S):
 
     for o in range(num_objs):
         presence_over_time = S[:, :, o].any(axis=1)  # shape: (num_steps,)
-        
+
+        if not presence_over_time.any():
             continue
         last_presence_time = np.where(presence_over_time)[0][-1]
         if last_presence_time < num_steps - 1:
@@ -46,7 +47,9 @@ def detect_local_removals(S, box_id):
     return removed_indices
 
 
-def generate_state_matrix(context, object_map, num_boxes=7, num_obj=100, contains_query=True):
+def generate_state_matrix(context, object_map, num_boxes=7, num_obj=100, contains_query=True, box_base=0):
+    # box_base: lowest box number in the dataset (0 for the original data, 1 for vlm-data);
+    # maps literal box numbers to 0-based state-matrix indices
     """
     input:
         context: the prefix context string, consisting of a initial state description, a sequence of operations, and a query sentence.
@@ -91,14 +94,14 @@ def generate_state_matrix(context, object_map, num_boxes=7, num_obj=100, contain
             # for both Put and Remove, there is only one box id, we use the NUM_BOXES + 1 as the world state for "outside the boxes"
             if operator == "Put":
                 src = num_boxes
-                tgt = int(box_ids[0])
+                tgt = int(box_ids[0]) - box_base
             elif operator == "Remove":
-                src = int(box_ids[0])
+                src = int(box_ids[0]) - box_base
                 tgt = num_boxes
         else:
             # only for move from b1 to b2, so b1 is the src, b2 is the tgt
-            src = int(box_ids[0])
-            tgt = int(box_ids[1])
+            src = int(box_ids[0]) - box_base
+            tgt = int(box_ids[1]) - box_base
 
         objects = re.findall(r'the ([^ ,.]+)', op)
         obj_idxs = [object_map[o] for o in objects if o in object_map]
@@ -127,7 +130,7 @@ def generate_state_matrix(context, object_map, num_boxes=7, num_obj=100, contain
         #     box_contents = [object_list[i] for i in range(num_obj) if state[timestep, b, i] == 1]
         #     print(f"Box {b}: {box_contents}")
     global_removed_objects = detect_removals(state) # now we're interested in the once mentioned but later removed objects. Just implement here for now.
-    box_id = int(query.split('Box ')[-1].split()[0]) if contains_query else None # extract the box id from the query, e.g., "What objects are in Box 2?"
+    box_id = int(query.split('Box ')[-1].split()[0]) - box_base if contains_query else None # extract the box id from the query, e.g., "What objects are in Box 2?"
     local_removed_objects = detect_local_removals(state, box_id) if contains_query else None # local removed objects from each box, we can also use this to validate the global removed objects.
         
     return state, global_removed_objects, local_removed_objects
