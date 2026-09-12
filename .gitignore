@@ -185,3 +185,7 @@ wandb/
 
 # path-patching / circuit outputs (large .npy/.pkl caches)
 outputs/
+
+# local result folders, not versioned
+probe_experiments/results/
+scratch/
