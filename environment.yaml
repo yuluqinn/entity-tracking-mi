@@ -1,4 +1,4 @@
-name: nnsight_env
+name: nnsight_env_fresh
 channels:
   - conda-forge
   - defaults
@@ -221,4 +221,4 @@ dependencies:
       - xxhash==3.5.0
       - yarl==1.20.1
       - zipp==3.23.0
-prefix: /my/conda/path/to/nnsight_env
+# prefix: /my/conda/path/to/nnsight_env

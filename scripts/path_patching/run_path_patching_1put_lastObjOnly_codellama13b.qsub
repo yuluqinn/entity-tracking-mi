@@ -58,7 +58,7 @@ MODEL_NAME="codellama-13b"
 cd nnsight_patching_experiments
 # CUDA_LAUNCH_BLOCKING=1 TORCH_USE_CUDA_DSA=true
 
-CUDA_LAUNCH_BLOCKING=1 TORCH_USE_CUDA_DSA=true python run_patching.py \
+CUDA_LAUNCH_BLOCKING=1 TORCH_USE_CUDA_DSA=true python run_path_patching.py \
   --model $MODEL \
   --datafile "${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty/train-t5.jsonl" \
   --batch_size 4 \

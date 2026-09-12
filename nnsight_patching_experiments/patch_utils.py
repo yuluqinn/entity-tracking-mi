@@ -12,8 +12,10 @@ import nnsight
 from nnsight import LanguageModel, CONFIG
 
 sys.path.append("..")
+# from utils import get_model_and_tokenizer, load_dataloader, get_random_guess_baseline, fix_random_seed, str_to_bool, \
+#     find_previous_query_box_pos, is_int_with_negatives, stupid_pad, PROMPT_ALTFORM, setup_nnsight
 from utils import get_model_and_tokenizer, load_dataloader, get_random_guess_baseline, fix_random_seed, str_to_bool, \
-    find_previous_query_box_pos, is_int_with_negatives, stupid_pad, PROMPT_ALTFORM, setup_nnsight
+    find_previous_query_box_pos, is_int_with_negatives, PROMPT_ALTFORM, setup_nnsight
 
 
 def build_parser():
