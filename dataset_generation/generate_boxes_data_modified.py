@@ -202,7 +202,7 @@ class WorldState:
         Returns:
             list: List of unique objects used in the prompts.
         """
-        return list(self.used_objects)
+        return sorted(self.used_objects)
 
     def add_used_boxes(self, boxes):
         """Add boxes that have been operated on to the used boxes list.
@@ -239,8 +239,8 @@ class WorldState:
         new_sentence = sentence
         # swap old set of objects to new set of objects
         if rand_obj:
-            alt_objects = random.sample(list(self.void), k=len(self.used_objects))
-            obj_map = {o: alt_objects[i] for i, o in enumerate(self.used_objects)}
+            alt_objects = random.sample(sorted(self.void), k=len(self.used_objects))
+            obj_map = {o: alt_objects[i] for i, o in enumerate(sorted(self.used_objects))}
             for old_obj, new_obj in obj_map.items():
                 new_sentence = new_sentence.replace(f" {old_obj} ", f" {new_obj} ").replace(f" {old_obj},",
                                                                                             f" {new_obj},").replace(
@@ -296,7 +296,7 @@ class WorldState:
                 num_items = np.minimum(num_items, [max_items_per_box])
 
         for i, n in enumerate(num_items):
-            items = np.random.choice(list(s.void), n, replace=False)
+            items = np.random.choice(sorted(s.void), n, replace=False)
             s.add_to_box(i, list(items))
             s.add_used_objects(items)
             s.initial_state[f"box_{i}"] = set(items)
@@ -366,7 +366,7 @@ class WorldState:
             # return f"{first_char}he {box_name} box contains the {list(self.boxes[box])[0]}{final_char}"
         else:
             box_contents = " and ".join(
-                [f"the {c}" for c in random.sample(self.boxes[box], len(self.boxes[box]))])  # sorted(self.boxes[box])
+                [f"the {c}" for c in random.sample(sorted(self.boxes[box]), len(self.boxes[box]))])
             if alt_description == True:
                 return f"{box_contents} are in {box_noun} {box_name}{final_char}"
             elif alt_description == "enum":
@@ -568,7 +568,7 @@ def random_nonempty_subset(s):
     if len(s) < 1:
         raise ValueError("Input set cannot be empty!")
     out = set()
-    for el in s:
+    for el in sorted(s):
         # random coin flip
         if random.randint(0, 1) == 0:
             out.add(el)
@@ -609,7 +609,7 @@ def describe_operation(
         content_pronoun = "them"
         from_prep = "of"
     elif contents is not None and len(contents) > 0:
-        content_str = " and ".join([f"the {c}" for c in random.sample(contents, len(contents))])  # sorted(contents)
+        content_str = " and ".join([f"the {c}" for c in random.sample(sorted(contents), len(contents))])
         content_pronoun = "it" if len(contents) == 1 else "them"
         content_verb = "is" if len(contents) == 1 else "are"
         from_prep = "from" if not alt_description else "in"
@@ -681,7 +681,7 @@ def example_to_t5(ex, state, zero_shot=True, modifier_map=None, pragmatic=False)
         masked_content = last_sent[start:]
 
     initial_state_serializable = {
-        box: list(contents) for box, contents in state.initial_state.items()
+        box: sorted(contents) for box, contents in state.initial_state.items()
     }
 
     return {
@@ -800,9 +800,9 @@ def sample_operation_sequences(
                 if args.favor_put_used_objects:
                     used_void_intersect = world_state.used_objects.intersection(world_state.void)
                     used_void_intersect = used_void_intersect if len(used_void_intersect) > 0 else world_state.void
-                    contents = random.sample(list(used_void_intersect), min(no_items, len(used_void_intersect)))
+                    contents = random.sample(sorted(used_void_intersect), min(no_items, len(used_void_intersect)))
                 else:
-                    contents = random.sample(list(world_state.void), no_items)
+                    contents = random.sample(sorted(world_state.void), no_items)
 
                 try:
                     world_state.add_to_box(box1, contents)
@@ -885,7 +885,7 @@ def make_modifier_map(object_set, pragmatic=False):
             modifier_map[obj] = f"{mod} {obj}"
     else:
         sampled_objects = random.sample(
-            object_set, len(object_set) // len(_MODIFIERS) + 1
+            sorted(object_set), len(object_set) // len(_MODIFIERS) + 1
         )
         new_objects = []
         for obj in sampled_objects:
