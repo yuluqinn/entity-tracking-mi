@@ -1,0 +1,80 @@
+#!/bin/bash -l
+# Path patching for CodeLlama-13b on the five seeded 1put datasets (robustness study).
+#
+# Array job: SGE task id 1..5 is the data seed. The circuit is the first argument.
+#   qsub scripts/path_patching/run_path_patching_1put_seeds_codellama13b.qsub put
+#   qsub scripts/path_patching/run_path_patching_1put_seeds_codellama13b.qsub describe
+# Submit from the repository root; the logs/ directory must exist (mkdir -p logs).
+#
+# Mirrors run_path_patching_1put_lastObjOnly_codellama13b.qsub / _notLastObj_ with:
+#   - seeded data file  data/boxes_altAlways_1put_moreObj_noEmpty_seed${SEED}/train-t5.jsonl
+#   - per-seed output   outputs/nnsight_patch_1put/codellama-13b/seed${SEED}/<logp_lastObjOnly|logp_notLastObj>
+# Re-submitting a task with the same output dir resumes from the first unfinished group.
+
+#$ -P tin-lab
+#$ -l h_rt=30:00:00
+#$ -N pp_seeds_codellama13b
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.$TASK_ID.log
+#$ -pe omp 2
+#$ -l gpus=1
+#$ -l gpu_c=8.5
+#$ -l gpu_memory=47G
+#$ -l gpu_type=L40S
+#$ -t 1-5
+
+CIRCUIT="${1:?usage: qsub ... run_path_patching_1put_seeds_codellama13b.qsub put|describe}"
+case "$CIRCUIT" in
+  put)      SUBDIR=logp_lastObjOnly; OBJ_INDEX="-1" ;;
+  describe) SUBDIR=logp_notLastObj;  OBJ_INDEX=":-1" ;;
+  *) echo "unknown circuit '$CIRCUIT' (expected put or describe)"; exit 1 ;;
+esac
+SEED=${SGE_TASK_ID}
+
+echo "=========================================================="
+echo "Start date : $(date)"
+echo "Job name   : $JOB_NAME   Job ID: $JOB_ID   Task: $SGE_TASK_ID"
+echo "Circuit    : $CIRCUIT   Seed: $SEED"
+echo "Host       : $(hostname)"
+echo "=========================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+module load miniconda
+conda activate /projectnb/tin-lab/yuluq/nnsight_env_fresh
+
+# HF_HOME / token come from ~/.bashrc; no wandb in this pipeline but keep it silent anyway.
+export WANDB_MODE=disabled
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ROOT=$(pwd)
+MODEL="codellama/CodeLlama-13b-hf"
+MODEL_NAME="codellama-13b"
+DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty_seed${SEED}/train-t5.jsonl"
+OUTDIR="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}/seed${SEED}/${SUBDIR}"
+
+if [ ! -f "$DATAFILE" ]; then echo "missing data file: $DATAFILE"; exit 1; fi
+echo "Data file  : $DATAFILE  (md5 $(md5sum "$DATAFILE" | cut -d' ' -f1))"
+echo "Output dir : $OUTDIR"
+
+cd "${ROOT}/nnsight_patching_experiments" || exit 1
+
+python run_path_patching.py \
+  --model "$MODEL" \
+  --datafile "$DATAFILE" \
+  --batch_size 4 \
+  --num_samples 200 \
+  --ops_order "put" \
+  --query_ops_order "put" \
+  --output_dir "$OUTDIR" \
+  --counterfactual "rand_obj_rand_query_id" \
+  --success_filter true \
+  --sort_query_objects \
+  --num_query_object 2 \
+  --score_source logp \
+  --use_object_index "$OBJ_INDEX" \
+  --load_in_8bit
+
+echo "=========================================================="
+echo "End date   : $(date)"
+echo "Saved groups:"; ls -la "$OUTDIR"/n200/pp_group*.npy 2>/dev/null
+echo "=========================================================="

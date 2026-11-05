@@ -1,0 +1,107 @@
+#!/bin/bash -l
+# Cross-group circuit evaluation for CodeLlama-13b (eval_circuits_cross_group.py), one run per job.
+#
+#   qsub [-P ivc-ml -q ivcbuyin -l gpu_type=A6000] scripts/path_patching/run_circuit_cross_eval_seeds_codellama13b.qsub <seed>
+#
+#   <seed> = 1..5  -> circuits under outputs/nnsight_patch_1put/codellama-13b/seed<N>/{logp_lastObjOnly,logp_notLastObj}/n200
+#   <seed> = orig  -> the Sep 2026 replication under outputs/nnsight_patch_1put/codellama-13b/{...}/n200
+#
+# Mirrors scripts/path_patching/run_circuit_cross_eval_1put_codellama13b.qsub: for each group A-D, evaluate the
+# put circuit with that group taken from the describe circuit, and the describe circuit with that group taken
+# from the put circuit (8 evaluations). Mean activations are cached per run so seeds never share a cache.
+# Results are printed only; a copy of stdout goes to logs/cross_<seed>.<jobid>.log. Submit from the repo root.
+
+#$ -P tin-lab
+#$ -l h_rt=6:00:00
+#$ -N cross_seeds_codellama13b
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+#$ -pe omp 2
+#$ -l gpus=1
+#$ -l gpu_c=8.5
+#$ -l gpu_memory=47G
+
+SEED="${1:?usage: qsub ... run_circuit_cross_eval_seeds_codellama13b.qsub <seed|orig>}"
+
+ROOT=$(pwd)
+MODEL="codellama/CodeLlama-13b-hf"
+MODEL_NAME="codellama-13b"
+if [ "$SEED" = "orig" ]; then
+  DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty/train-t5.jsonl"
+  RUN_ROOT="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}"
+else
+  DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty_seed${SEED}/train-t5.jsonl"
+  RUN_ROOT="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}/seed${SEED}"
+fi
+PUT_CIRCUIT_PATH="${RUN_ROOT}/logp_lastObjOnly/n200"
+DESC_CIRCUIT_PATH="${RUN_ROOT}/logp_notLastObj/n200"
+CACHE="${RUN_ROOT}/cross_eval_cache"
+LOG="${ROOT}/logs/cross_${SEED}.${JOB_ID}.log"
+
+echo "=========================================================="
+echo "Start date   : $(date)"
+echo "Job          : $JOB_NAME  $JOB_ID   host $(hostname)"
+echo "Seed         : $SEED"
+echo "Data file    : $DATAFILE"
+echo "Put circuit  : $PUT_CIRCUIT_PATH"
+echo "Desc circuit : $DESC_CIRCUIT_PATH"
+echo "=========================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+for d in "$PUT_CIRCUIT_PATH" "$DESC_CIRCUIT_PATH"; do for g in A B C D; do
+  [ -f "$d/pp_group$g.npy" ] || { echo "missing $d/pp_group$g.npy - circuit incomplete"; exit 1; }
+done; done
+[ -f "$DATAFILE" ] || { echo "missing data file: $DATAFILE"; exit 1; }
+mkdir -p "$CACHE"
+echo "Data md5     : $(md5sum "$DATAFILE" | cut -d' ' -f1)"
+
+module load miniconda
+conda activate /projectnb/tin-lab/yuluq/nnsight_env_fresh
+export WANDB_MODE=disabled
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+cd "${ROOT}/nnsight_patching_experiments" || exit 1
+
+{
+for PATCH_GROUP in A B C D; do
+  echo "============== patch describe-circuit group ${PATCH_GROUP} into put circuit =============="
+  python eval_circuits_cross_group.py \
+    --model "$MODEL" \
+    --datafile "$DATAFILE" \
+    --batch_size 4 \
+    --num_samples 100 \
+    --ops_order "put" \
+    --query_ops_order "put" \
+    --counterfactual "rand_obj_rand_query_id" \
+    --num_query_object 2 \
+    --sort_query_objects \
+    --circuit1_root_path "$PUT_CIRCUIT_PATH" \
+    --circuit2_root_path "$DESC_CIRCUIT_PATH" \
+    --mean_activation_cache_path "$CACHE" \
+    --patch_group "$PATCH_GROUP" \
+    --load_in_8bit
+
+  echo "============== patch put-circuit group ${PATCH_GROUP} into describe circuit =============="
+  python eval_circuits_cross_group.py \
+    --model "$MODEL" \
+    --datafile "$DATAFILE" \
+    --batch_size 4 \
+    --num_samples 100 \
+    --ops_order "put" \
+    --query_ops_order "put" \
+    --counterfactual "rand_obj_rand_query_id" \
+    --num_query_object 2 \
+    --sort_query_objects \
+    --circuit1_root_path "$DESC_CIRCUIT_PATH" \
+    --circuit2_root_path "$PUT_CIRCUIT_PATH" \
+    --mean_activation_cache_path "$CACHE" \
+    --patch_group "$PATCH_GROUP" \
+    --load_in_8bit
+done
+} 2>&1 | tee "$LOG"
+
+echo "=========================================================="
+echo "End date     : $(date)"
+echo "Result log   : $LOG"
+grep -E "^==============|Model Performance|Circuit Performance|Random Circuit Average|Faithfulness" "$LOG"
+echo "=========================================================="

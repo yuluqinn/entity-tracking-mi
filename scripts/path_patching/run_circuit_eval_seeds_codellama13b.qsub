@@ -1,0 +1,88 @@
+#!/bin/bash -l
+# Circuit faithfulness evaluation for CodeLlama-13b (eval_circuits.py), one circuit per job.
+#
+#   qsub [-P ivc-ml -q ivcbuyin -l gpu_type=L40] scripts/path_patching/run_circuit_eval_seeds_codellama13b.qsub <put|describe> <seed>
+#
+#   <seed> = 1..5  -> circuit traced on data/boxes_altAlways_1put_moreObj_noEmpty_seed<N>,
+#                     scores under outputs/nnsight_patch_1put/codellama-13b/seed<N>/<subdir>/n200
+#   <seed> = orig  -> the Sep 2026 replication trace on data/boxes_altAlways_1put_moreObj_noEmpty,
+#                     scores under outputs/nnsight_patch_1put/codellama-13b/<subdir>/n200
+#
+# Mirrors scripts/path_patching/run_circuit_eval_1put_{lastObjOnly,notLastObj}_codellama13.qsub.
+# Heads per group are chosen by the knee method inside eval_circuits.py (no extra heads, as the
+# authors did for CodeLlama). Results are printed only; a copy of stdout goes to
+# logs/eval_<circuit>_<seed>.<jobid>.log. Mean activations are cached next to the circuit scores.
+# Submit from the repository root; logs/ must exist.
+
+#$ -P tin-lab
+#$ -l h_rt=6:00:00
+#$ -N eval_seeds_codellama13b
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+#$ -pe omp 2
+#$ -l gpus=1
+#$ -l gpu_c=8.5
+#$ -l gpu_memory=47G
+
+CIRCUIT="${1:?usage: qsub ... run_circuit_eval_seeds_codellama13b.qsub put|describe <seed|orig>}"
+SEED="${2:?usage: qsub ... run_circuit_eval_seeds_codellama13b.qsub put|describe <seed|orig>}"
+case "$CIRCUIT" in
+  put)      SUBDIR=logp_lastObjOnly ;;
+  describe) SUBDIR=logp_notLastObj ;;
+  *) echo "unknown circuit '$CIRCUIT' (expected put or describe)"; exit 1 ;;
+esac
+
+ROOT=$(pwd)
+MODEL="codellama/CodeLlama-13b-hf"
+MODEL_NAME="codellama-13b"
+if [ "$SEED" = "orig" ]; then
+  DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty/train-t5.jsonl"
+  CIRCUIT_ROOT="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}/${SUBDIR}/n200"
+else
+  DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty_seed${SEED}/train-t5.jsonl"
+  CIRCUIT_ROOT="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}/seed${SEED}/${SUBDIR}/n200"
+fi
+LOG="${ROOT}/logs/eval_${CIRCUIT}_${SEED}.${JOB_ID}.log"
+
+echo "=========================================================="
+echo "Start date   : $(date)"
+echo "Job          : $JOB_NAME  $JOB_ID   host $(hostname)"
+echo "Circuit      : $CIRCUIT   Seed: $SEED"
+echo "Data file    : $DATAFILE"
+echo "Circuit root : $CIRCUIT_ROOT"
+echo "=========================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+for g in A B C D; do
+  [ -f "$CIRCUIT_ROOT/pp_group$g.npy" ] || { echo "missing $CIRCUIT_ROOT/pp_group$g.npy - circuit incomplete"; exit 1; }
+done
+[ -f "$DATAFILE" ] || { echo "missing data file: $DATAFILE"; exit 1; }
+echo "Data md5     : $(md5sum "$DATAFILE" | cut -d' ' -f1)"
+
+module load miniconda
+conda activate /projectnb/tin-lab/yuluq/nnsight_env_fresh
+export WANDB_MODE=disabled
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+cd "${ROOT}/nnsight_patching_experiments" || exit 1
+
+python eval_circuits.py \
+  --model "$MODEL" \
+  --datafile "$DATAFILE" \
+  --batch_size 4 \
+  --num_samples 100 \
+  --ops_order "put" \
+  --query_ops_order "put" \
+  --counterfactual "rand_obj_rand_query_id" \
+  --num_query_object 2 \
+  --sort_query_objects \
+  --circuit_root_path "$CIRCUIT_ROOT" \
+  --mean_activation_cache_path "$CIRCUIT_ROOT" \
+  --load_in_8bit \
+  2>&1 | tee "$LOG"
+
+echo "=========================================================="
+echo "End date     : $(date)"
+echo "Result log   : $LOG"
+grep -E "len\(group|Model Performance|Circuit Performance|Random Circuit Average|Faithfulness" "$LOG"
+echo "=========================================================="

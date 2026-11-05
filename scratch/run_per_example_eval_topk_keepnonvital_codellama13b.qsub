@@ -1,0 +1,92 @@
+#!/bin/bash -l
+# Large DESCRIBE head cuts with the non-vital positions kept (CodeLlama-13b, single-PUT), per example on the
+# fixed 150-example set. Separates the two possible sources of the remaining DESCRIBE gap under the paper's
+# protocol: the positional rule (66 non-vital positions mean-ablated) versus heads the single-head ranking excludes.
+#
+#   qsub -P ivc-ml -q ivcbuyin scratch/run_per_example_eval_topk_keepnonvital_codellama13b.qsub
+#
+# Conditions: full model, two sanity conditions, seed0/seed4 knee DESCRIBE circuits, top-160 / top-320 / all
+# negative-score heads per group from the seed0 and seed4 DESCRIBE rankings (standard rule), and each of those
+# eight head sets again with ablate_non_vital_pos=False (--keep_nonvital).
+# Output: outputs/per_example_eval/codellama-13b_topk_keepnonvital/{per_example.jsonl, summary.json}
+# Log:    logs/per_example_eval_topk_keepnonvital.<jobid>.log      Submit from the repository root; logs/ must exist.
+#$ -P tin-lab
+#$ -l h_rt=2:00:00
+#$ -N per_example_eval_topk_keepnonvital_codellama13b
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+#$ -pe omp 2
+#$ -l gpus=1
+#$ -l gpu_c=8.0
+#$ -l gpu_memory=47G
+
+ROOT=$(pwd)
+MODEL="codellama/CodeLlama-13b-hf"
+MODEL_NAME="codellama-13b"
+DATAFILE="${ROOT}/data/boxes_altAlways_1put_moreObj_noEmpty/train-t5.jsonl"
+MAP_JSONL="${ROOT}/outputs/behavioral_map/${MODEL_NAME}/orig/map_CodeLlama-13b-hf_8bit_boxes_altAlways_1put_moreObj_noEmpty_n2000.jsonl"
+CIRCUIT_ROOT="${ROOT}/outputs/nnsight_patch_1put/${MODEL_NAME}"
+MEAN_CACHE="${CIRCUIT_ROOT}/logp_lastObjOnly/n200"
+OUT_DIR="${ROOT}/outputs/per_example_eval/${MODEL_NAME}_topk_keepnonvital"
+LOG="${ROOT}/logs/per_example_eval_topk_keepnonvital.${JOB_ID}.log"
+
+echo "=========================================================="
+echo "Start date   : $(date)"
+echo "Job          : $JOB_NAME  $JOB_ID   host $(hostname)"
+echo "Data file    : $DATAFILE"
+echo "Map jsonl    : $MAP_JSONL"
+echo "Mean cache   : $MEAN_CACHE/mean_activations.pkl"
+echo "Output dir   : $OUT_DIR"
+echo "=========================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv
+for f in "$DATAFILE" "$MAP_JSONL" "$MEAN_CACHE/mean_activations.pkl"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
+for d in logp_notLastObj logp_lastObjOnly seed4/logp_notLastObj seed4/logp_lastObjOnly; do for g in A B C D; do
+  [ -f "$CIRCUIT_ROOT/$d/n200/pp_group$g.npy" ] || { echo "missing $CIRCUIT_ROOT/$d/n200/pp_group$g.npy"; exit 1; }
+done; done
+echo "Data md5     : $(md5sum "$DATAFILE" | cut -d' ' -f1)"
+echo "Cache md5    : $(md5sum "$MEAN_CACHE/mean_activations.pkl" | cut -d' ' -f1)"
+
+module load miniconda
+conda activate /projectnb/tin-lab/yuluq/nnsight_env_fresh
+export WANDB_MODE=disabled
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+mkdir -p "$OUT_DIR"
+
+cd "${ROOT}" || exit 1
+python scratch/per_example_circuit_eval.py \
+  --model "$MODEL" \
+  --datafile "$DATAFILE" \
+  --map_jsonl "$MAP_JSONL" \
+  --batch_size 4 \
+  --num_samples 2000 \
+  --ops_order "put" \
+  --query_ops_order "put" \
+  --counterfactual_format "rand_obj_rand_query_id" \
+  --num_query_object 2 \
+  --sort_query_objects \
+  --load_in_8bit \
+  --mean_activation_cache_path "$MEAN_CACHE" \
+  --circuit "orig_describe=${CIRCUIT_ROOT}/logp_notLastObj/n200" \
+  --circuit "seed4_describe=${CIRCUIT_ROOT}/seed4/logp_notLastObj/n200" \
+  --topk "orig_desc_k160=orig_describe:160,160,160,160" \
+  --topk "orig_desc_k320=orig_describe:320,320,320,320" \
+  --topk "orig_desc_allneg=orig_describe:9999,9999,9999,9999" \
+  --topk "seed4_desc_k160=seed4_describe:160,160,160,160" \
+  --topk "seed4_desc_k320=seed4_describe:320,320,320,320" \
+  --topk "seed4_desc_allneg=seed4_describe:9999,9999,9999,9999" \
+  --keep_nonvital orig_describe \
+  --keep_nonvital seed4_describe \
+  --keep_nonvital orig_desc_k160 \
+  --keep_nonvital orig_desc_k320 \
+  --keep_nonvital orig_desc_allneg \
+  --keep_nonvital seed4_desc_k160 \
+  --keep_nonvital seed4_desc_k320 \
+  --keep_nonvital seed4_desc_allneg \
+  --fixed_start_rank 1000 --n_fixed 150 --n_repro 100 \
+  --out_dir "$OUT_DIR" \
+  2>&1 | tee "$LOG"
+
+echo "=========================================================="
+echo "End date     : $(date)"
+echo "Result log   : $LOG"
+echo "=========================================================="
